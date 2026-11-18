@@ -1,0 +1,6 @@
+{
+  "name": "KALFY — Academia Táctica de Ciberseguridad",
+  "description": "Academia táctica e interactiva de ciberseguridad, Linux, Python y hacking ético para Android. 192 clases, laboratorios CLI, 16 retos CTF y descarga oficial de APK.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
