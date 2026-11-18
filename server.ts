@@ -11,9 +11,11 @@ dotenv.config();
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
-const DATA_DIR = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(ROOT_DIR, 'data');
+const RAW_DATA_DIR = process.env.DATA_DIR?.trim();
+const DATA_DIR =
+  RAW_DATA_DIR && (RAW_DATA_DIR.includes('/') || RAW_DATA_DIR.startsWith('.'))
+    ? path.resolve(RAW_DATA_DIR)
+    : path.join(ROOT_DIR, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const RELEASES_FILE = path.join(DATA_DIR, 'releases.json');
 
@@ -127,7 +129,7 @@ function loadState(): StoredState {
         sha256: starter.sha256,
         releaseDate: '2026-11-18',
         createdAt: '2026-11-18T10:00:00.000Z',
-        downloads: 1248,
+        downloads: 0,
         sourceType: 'starter',
         storageFileName: starter.fileName,
         notes: [
@@ -136,24 +138,6 @@ function loadState(): StoredState {
           '16 Misiones CTF en vivo con validación automática de banderas KALFY{...}',
           'Sincronización en la nube mejorada para conservar tu XP y rango al actualizar el APK',
           'Nuevos sprites pixel-art de los 12 Rangos Oficiales y Ranking Global en tiempo real'
-        ]
-      },
-      {
-        id: 'rel-1-0-0',
-        version: '1.0.0',
-        fileName: 'kalfy-v1.0.0-inicial.apk',
-        sizeBytes: 23278387,
-        sizeFormatted: '22.2 MB',
-        sha256: '3a7f9c12e84b01d5f49a6c8e2b7d104a8f2c5e9b1d4a7c0f3e6b8d1a4c7e9f02',
-        releaseDate: '2026-10-04',
-        createdAt: '2026-10-04T15:30:00.000Z',
-        downloads: 864,
-        sourceType: 'starter',
-        storageFileName: starter.fileName,
-        notes: [
-          'Lanzamiento oficial de KALFY para Android',
-          'Módulos iniciales de Redes, Linux, Python y Criptografía',
-          'Sistema de XP por clase completada y entrega de Proyectos Finales'
         ]
       }
     ]
@@ -284,14 +268,16 @@ async function startServer() {
 
   // Public state for Landing Page
   app.get('/api/public/state', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.json(buildPublicState());
   });
 
   // Real-time Server-Sent Events stream
   app.get('/api/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
     res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
 
@@ -312,8 +298,12 @@ async function startServer() {
 
   // Public APK Download endpoint (increments counter + streams file or redirects)
   app.get('/api/apk/download', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     if (appState.maintenanceMode) {
-      res.status(503).json({ error: 'Descargas pausadas temporalmente por mantenimiento.' });
+      res.setHeader('Retry-After', '300');
+      res.status(503).json({
+        error: 'KALFY está en modo mantenimiento. Las descargas están pausadas temporalmente.'
+      });
       return;
     }
 
@@ -351,9 +341,12 @@ async function startServer() {
   // Admin Login
   app.post('/api/admin/login', (req, res) => {
     const { username, password } = req.body as { username?: string; password?: string };
-    if (username === ADMIN_USER && password === ADMIN_PASSWORD) {
-      const token = signAdminToken(username);
-      res.json({ token, username });
+    const cleanUser = typeof username === 'string' ? username.trim().toLowerCase() : '';
+    const cleanPass = typeof password === 'string' ? password.trim().replace(/^¡+/, '') : '';
+    const validUsers = new Set(['admin', 'administración', 'administracion', 'administrador']);
+    if (validUsers.has(cleanUser) && cleanPass === ADMIN_PASSWORD) {
+      const token = signAdminToken(ADMIN_USER);
+      res.json({ token, username: ADMIN_USER });
       return;
     }
     res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
@@ -361,6 +354,15 @@ async function startServer() {
 
   // Admin State
   app.get('/api/admin/state', requireAdmin, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json(buildAdminState());
+  });
+
+  // Admin Reset Download Counters to 0
+  app.post('/api/admin/reset-downloads', requireAdmin, (_req, res) => {
+    appState.releases = appState.releases.map((r) => ({ ...r, downloads: 0 }));
+    saveState(appState);
+    broadcastStateUpdate();
     res.json(buildAdminState());
   });
 

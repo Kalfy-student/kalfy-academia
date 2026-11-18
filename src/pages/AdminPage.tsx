@@ -6,6 +6,8 @@ import {
   CheckCircle2,
   Copy,
   Edit3,
+  Eye,
+  EyeOff,
   FileArchive,
   Link as LinkIcon,
   Lock,
@@ -28,8 +30,8 @@ interface AdminPageProps {
 }
 
 const TOKEN_STORAGE_KEY = 'kalfy_admin_token';
-const ADMIN_BACKUP_KEY = 'kalfy_admin_releases_backup';
-const PUBLIC_CACHE_KEY = 'kalfy_public_state_cache';
+const ADMIN_BACKUP_KEY = 'kalfy_admin_releases_backup_v2';
+const PUBLIC_CACHE_KEY = 'kalfy_public_state_cache_v2';
 
 function syncLocalStorageBackup(state: AdminAppState) {
   try {
@@ -57,10 +59,13 @@ export default function AdminPage({
   );
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
 
   const [adminState, setAdminState] = useState<AdminAppState | null>(null);
+  const [loadingState, setLoadingState] = useState(false);
+  const [togglingMaintenance, setTogglingMaintenance] = useState(false);
   const [stateError, setStateError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
 
@@ -93,8 +98,10 @@ export default function AdminPage({
   };
 
   const fetchAdminState = useCallback(async (authToken: string) => {
+    setLoadingState(true);
     try {
       const res = await fetch('/api/admin/state', {
+        cache: 'no-store',
         headers: { Authorization: `Bearer ${authToken}` }
       });
       if (res.status === 401) {
@@ -118,13 +125,28 @@ export default function AdminPage({
       setStateError(null);
     } catch (err) {
       setStateError(err instanceof Error ? err.message : 'Error de conexión');
+    } finally {
+      setLoadingState(false);
     }
   }, []);
 
   useEffect(() => {
-    if (token) {
-      fetchAdminState(token);
-    }
+    if (!token) return;
+    fetchAdminState(token);
+    const evtSource = new EventSource('/api/events');
+    evtSource.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data) as { type?: string };
+        if (parsed.type === 'state_updated') {
+          fetchAdminState(token);
+        }
+      } catch {
+        // Ignore SSE keepalive
+      }
+    };
+    return () => {
+      evtSource.close();
+    };
   }, [token, fetchAdminState]);
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -135,7 +157,7 @@ export default function AdminPage({
       const res = await fetch('/api/admin/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username: username.trim(), password: password.trim() })
       });
       const data = (await res.json()) as { token?: string; error?: string };
       if (!res.ok || !data.token) {
@@ -269,29 +291,64 @@ export default function AdminPage({
   };
 
   const handleToggleMaintenance = async () => {
-    if (!token || !adminState) return;
+    if (!token || !adminState || togglingMaintenance) return;
+    setTogglingMaintenance(true);
     try {
+      const nextMode = !adminState.maintenanceMode;
       const res = await fetch('/api/admin/maintenance', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ maintenanceMode: !adminState.maintenanceMode })
+        body: JSON.stringify({ maintenanceMode: nextMode })
       });
-      const data = (await res.json()) as AdminAppState;
-      if (res.ok) {
-        setAdminState(data);
-        syncLocalStorageBackup(data);
-        showFeedback(
-          'ok',
-          data.maintenanceMode
-            ? 'Modo Mantenimiento activado en la web pública.'
-            : 'Descargas activadas en la web pública.'
-        );
+      if (res.status === 401) {
+        handleLogout();
+        setAuthError('Tu sesión expiró. Inicia sesión nuevamente.');
+        return;
       }
+      const data = (await res.json()) as AdminAppState & { error?: string };
+      if (!res.ok) {
+        showFeedback('err', data.error || 'No se pudo cambiar el estado de mantenimiento.');
+        return;
+      }
+      setAdminState(data);
+      syncLocalStorageBackup(data);
+      showFeedback(
+        'ok',
+        data.maintenanceMode
+          ? 'Modo Mantenimiento ACTIVADO: la web pública y las descargas están pausadas.'
+          : 'Modo Mantenimiento DESACTIVADO: la web pública y las descargas están en vivo.'
+      );
     } catch {
       showFeedback('err', 'No se pudo cambiar el estado de mantenimiento.');
+    } finally {
+      setTogglingMaintenance(false);
+    }
+  };
+
+  const handleResetDownloads = async () => {
+    if (!token) return;
+    try {
+      const res = await fetch('/api/admin/reset-downloads', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
+      const data = (await res.json()) as AdminAppState & { error?: string };
+      if (!res.ok) {
+        showFeedback('err', data.error || 'Error al reiniciar contadores.');
+        return;
+      }
+      setAdminState(data);
+      syncLocalStorageBackup(data);
+      showFeedback('ok', 'Contadores de descargas reiniciados a 0.');
+    } catch {
+      showFeedback('err', 'Error al reiniciar contadores.');
     }
   };
 
@@ -306,12 +363,18 @@ export default function AdminPage({
         },
         body: JSON.stringify({ activate: true })
       });
-      const data = (await res.json()) as AdminAppState;
-      if (res.ok) {
-        setAdminState(data);
-        syncLocalStorageBackup(data);
-        showFeedback('ok', 'Versión activada inmediatamente en la página principal.');
+      if (res.status === 401) {
+        handleLogout();
+        return;
       }
+      const data = (await res.json()) as AdminAppState & { error?: string };
+      if (!res.ok) {
+        showFeedback('err', data.error || 'Error al activar la versión.');
+        return;
+      }
+      setAdminState(data);
+      syncLocalStorageBackup(data);
+      showFeedback('ok', 'Versión activada inmediatamente en la página principal.');
     } catch {
       showFeedback('err', 'Error al activar la versión.');
     }
@@ -388,13 +451,19 @@ export default function AdminPage({
           notes: notesArray
         })
       });
-      const data = (await res.json()) as AdminAppState;
-      if (res.ok) {
-        setAdminState(data);
-        syncLocalStorageBackup(data);
-        setEditingRelease(null);
-        showFeedback('ok', 'Metadatos de versión actualizados en vivo.');
+      if (res.status === 401) {
+        handleLogout();
+        return;
       }
+      const data = (await res.json()) as AdminAppState & { error?: string };
+      if (!res.ok) {
+        showFeedback('err', data.error || 'No se pudieron guardar los cambios.');
+        return;
+      }
+      setAdminState(data);
+      syncLocalStorageBackup(data);
+      setEditingRelease(null);
+      showFeedback('ok', 'Metadatos de versión actualizados en vivo.');
     } catch {
       showFeedback('err', 'No se pudieron guardar los cambios.');
     }
@@ -472,7 +541,7 @@ export default function AdminPage({
   // Login Screen
   if (!token) {
     return (
-      <div className="min-h-screen bg-[#F4F7FA] dark:bg-[#05080D] flex flex-col">
+      <div translate="no" className="min-h-screen bg-[#F4F7FA] dark:bg-[#05080D] flex flex-col notranslate">
         {renderHeader()}
         <main className="flex-1 flex items-center justify-center p-4">
           <div className="w-full max-w-md rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131C] p-6 sm:p-8 shadow-lg">
@@ -497,7 +566,7 @@ export default function AdminPage({
               </div>
             )}
 
-            <form onSubmit={handleLogin} className="space-y-4">
+            <form onSubmit={handleLogin} translate="no" className="space-y-4 notranslate">
               <div>
                 <label
                   htmlFor="admin-user"
@@ -512,6 +581,10 @@ export default function AdminPage({
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="admin"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  autoComplete="username"
                   className="w-full h-11 px-3.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-[#05080D] text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
               </div>
@@ -523,15 +596,29 @@ export default function AdminPage({
                 >
                   Contraseña
                 </label>
-                <input
-                  id="admin-pass"
-                  type="password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••••••"
-                  className="w-full h-11 px-3.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-[#05080D] text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
+                <div className="relative">
+                  <input
+                    id="admin-pass"
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••••"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    autoComplete="current-password"
+                    className="w-full h-11 pl-3.5 pr-11 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-[#05080D] text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                    aria-label={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-md text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 cursor-pointer"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <button
@@ -553,7 +640,10 @@ export default function AdminPage({
   );
 
   return (
-    <div className="min-h-screen bg-[#F4F7FA] dark:bg-[#05080D] text-slate-900 dark:text-slate-100">
+    <div
+      translate="no"
+      className="min-h-screen bg-[#F4F7FA] dark:bg-[#05080D] text-slate-900 dark:text-slate-100 notranslate"
+    >
       {renderHeader()}
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -576,8 +666,42 @@ export default function AdminPage({
         )}
 
         {stateError && (
-          <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-600 dark:text-red-300">
-            {stateError}
+          <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-600 dark:text-red-300 flex items-center justify-between gap-3">
+            <span>{stateError}</span>
+            <button
+              type="button"
+              onClick={() => token && fetchAdminState(token)}
+              className="px-3 py-1.5 rounded-md bg-red-500/20 hover:bg-red-500/30 font-semibold text-xs cursor-pointer shrink-0"
+            >
+              Reintentar
+            </button>
+          </div>
+        )}
+
+        {loadingState && !adminState && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131C] p-6 text-sm text-slate-600 dark:text-slate-300 flex items-center gap-3">
+            <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
+            <span>Cargando estado del servidor y lanzamientos...</span>
+          </div>
+        )}
+
+        {adminState?.maintenanceMode && (
+          <div className="rounded-xl border border-amber-500/45 bg-amber-500/12 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start sm:items-center gap-3 text-xs sm:text-sm text-amber-800 dark:text-amber-200">
+              <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5 sm:mt-0" />
+              <div>
+                <strong className="font-semibold">Modo Mantenimiento Activo:</strong> La página pública muestra el aviso de mantenimiento y las descargas del APK están bloqueadas.
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={togglingMaintenance}
+              onClick={handleToggleMaintenance}
+              className="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs inline-flex items-center gap-1.5 shrink-0 disabled:opacity-60 cursor-pointer"
+            >
+              <Power className="w-3.5 h-3.5" />
+              <span>{togglingMaintenance ? 'Actualizando...' : 'Desactivar Mantenimiento'}</span>
+            </button>
           </div>
         )}
 
@@ -635,18 +759,31 @@ export default function AdminPage({
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131C] p-5">
-            <div className="font-mono text-xs text-slate-500 dark:text-slate-400">
-              Descargas APK Actual / Total
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131C] p-5 flex flex-col justify-between">
+            <div>
+              <div className="font-mono text-xs text-slate-500 dark:text-slate-400">
+                Descargas APK Actual / Total
+              </div>
+              <div className="mt-1.5 font-display text-2xl font-bold text-slate-900 dark:text-slate-50 tabular-nums">
+                {activeRelease ? activeRelease.downloads.toLocaleString('es-ES') : '0'}{' '}
+                <span className="text-sm font-mono font-normal text-slate-500">
+                  / {adminState ? adminState.totalDownloads.toLocaleString('es-ES') : '0'}
+                </span>
+              </div>
             </div>
-            <div className="mt-1.5 font-display text-2xl font-bold text-slate-900 dark:text-slate-50 tabular-nums">
-              {activeRelease ? activeRelease.downloads.toLocaleString('es-ES') : '0'}{' '}
-              <span className="text-sm font-mono font-normal text-slate-500">
-                / {adminState ? adminState.totalDownloads.toLocaleString('es-ES') : '0'}
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                Registro real en vivo
               </span>
-            </div>
-            <div className="mt-1 font-mono text-xs text-slate-500 dark:text-slate-400">
-              Contador persistente en vivo
+              {adminState && adminState.totalDownloads > 0 && (
+                <button
+                  type="button"
+                  onClick={handleResetDownloads}
+                  className="font-mono text-[11px] text-amber-600 dark:text-amber-400 hover:underline cursor-pointer"
+                >
+                  Reiniciar a 0
+                </button>
+              )}
             </div>
           </div>
 
@@ -679,8 +816,9 @@ export default function AdminPage({
             </div>
             <button
               type="button"
+              disabled={!adminState || togglingMaintenance}
               onClick={handleToggleMaintenance}
-              className={`mt-3 w-full h-10 px-3 rounded-lg font-medium text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+              className={`mt-3 w-full h-10 px-3 rounded-lg font-medium text-xs flex items-center justify-center gap-2 transition-colors disabled:opacity-60 cursor-pointer ${
                 adminState?.maintenanceMode
                   ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
                   : 'bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-700 dark:text-amber-300'
@@ -688,9 +826,11 @@ export default function AdminPage({
             >
               <Power className="w-3.5 h-3.5" />
               <span>
-                {adminState?.maintenanceMode
-                  ? 'Activar Descarga en Web'
-                  : 'Poner Web en Mantenimiento'}
+                {togglingMaintenance
+                  ? 'Actualizando...'
+                  : adminState?.maintenanceMode
+                    ? 'Activar Descarga en Web'
+                    : 'Poner Web en Mantenimiento'}
               </span>
             </button>
           </div>

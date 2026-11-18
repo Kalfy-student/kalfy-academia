@@ -15,13 +15,15 @@ interface HeroSectionProps {
   release: ApkRelease | null;
   maintenanceMode: boolean;
   loading: boolean;
+  onRefreshState?: () => void;
 }
 
 export default function HeroSection({
   theme,
   release,
   maintenanceMode,
-  loading
+  loading,
+  onRefreshState
 }: HeroSectionProps) {
   const [guideOpen, setGuideOpen] = useState(false);
 
@@ -31,13 +33,13 @@ export default function HeroSection({
   return (
     <section
       id="inicio"
-      className="relative min-h-[calc(100vh-3.75rem)] pt-24 sm:pt-28 pb-10 lg:pb-12 flex items-start lg:items-center overflow-hidden border-b border-slate-200 dark:border-slate-800/80"
+      className="relative scroll-mt-20 min-h-[calc(100vh-8.25rem)] py-6 sm:py-8 lg:py-8 flex items-center overflow-hidden border-b border-slate-200 dark:border-slate-800/80"
     >
       {/* Interactive Mouse-Parallax Galaxy + Animated Starfield Canvas */}
       <GalaxyBackground theme={theme} />
 
       <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-8 items-center">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-6 items-center">
           {/* Left Column: Clean Title + Download APK Button + Current Version Only */}
           <div className="lg:col-span-5 space-y-5">
             <div>
@@ -60,7 +62,7 @@ export default function HeroSection({
             {/* Clean Download Card — Current Version & Download Button Only */}
             <div
               id="descargar"
-              className="rounded-2xl border border-slate-200 dark:border-emerald-500/30 bg-white/92 dark:bg-[#0D131C]/92 backdrop-blur-md p-5 shadow-sm space-y-4"
+              className="scroll-mt-20 rounded-2xl border border-slate-200 dark:border-emerald-500/30 bg-white/92 dark:bg-[#0D131C]/92 backdrop-blur-md p-5 shadow-sm space-y-4"
             >
               {maintenanceMode ? (
                 <div className="flex items-start gap-3">
@@ -84,6 +86,12 @@ export default function HeroSection({
                         ? `/api/apk/download?id=${encodeURIComponent(release.id)}`
                         : '/api/apk/download'
                     }
+                    download={release?.fileName || 'kalfy-oficial.apk'}
+                    onClick={() => {
+                      if (onRefreshState) {
+                        window.setTimeout(() => onRefreshState(), 800);
+                      }
+                    }}
                     className="w-full inline-flex items-center justify-center gap-3 px-6 py-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 dark:bg-emerald-500 dark:hover:bg-emerald-400 text-white dark:text-slate-950 font-display font-bold text-base tracking-tight transition-colors shadow-sm"
                   >
                     <Download className="w-5 h-5 shrink-0" />
