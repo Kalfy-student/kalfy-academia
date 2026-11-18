@@ -24,7 +24,7 @@ function AndroidFrame({ id, label, children }: AndroidFrameProps) {
   return (
     <div id={id} className="flex flex-col items-center">
       {/* Sleek Android Device Bezel */}
-      <div className="relative w-[290px] sm:w-[306px] h-[596px] rounded-[2.25rem] p-[9px] bg-gradient-to-b from-slate-700 via-slate-800 to-slate-900 shadow-2xl border border-slate-600/60 dark:border-slate-700/90">
+      <div className="relative w-[286px] sm:w-[300px] h-[545px] lg:h-[565px] rounded-[2.25rem] p-[9px] bg-gradient-to-b from-slate-700 via-slate-800 to-slate-900 shadow-2xl border border-slate-600/60 dark:border-slate-700/90">
         {/* Inner Screen */}
         <div className="relative w-full h-full rounded-[1.75rem] overflow-hidden bg-[#070B12] text-slate-100 flex flex-col border border-slate-800">
           {/* Android Status Bar + Punch-Hole Camera */}

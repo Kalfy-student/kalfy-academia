@@ -12,13 +12,14 @@ import {
   LogOut,
   Moon,
   Power,
+  RefreshCw,
   Shield,
   Sun,
   Trash2,
   Upload,
   X
 } from 'lucide-react';
-import type { AdminAppState, ApkRelease } from '../types.ts';
+import type { AdminAppState, ApkRelease, PublicAppState } from '../types.ts';
 
 interface AdminPageProps {
   theme: 'dark' | 'light';
@@ -27,6 +28,24 @@ interface AdminPageProps {
 }
 
 const TOKEN_STORAGE_KEY = 'kalfy_admin_token';
+const ADMIN_BACKUP_KEY = 'kalfy_admin_releases_backup';
+const PUBLIC_CACHE_KEY = 'kalfy_public_state_cache';
+
+function syncLocalStorageBackup(state: AdminAppState) {
+  try {
+    localStorage.setItem(ADMIN_BACKUP_KEY, JSON.stringify(state));
+    const activeRelease =
+      state.releases.find((r) => r.id === state.activeReleaseId) || state.releases[0] || null;
+    const publicSnapshot: PublicAppState = {
+      maintenanceMode: state.maintenanceMode,
+      activeRelease,
+      changelogHistory: state.releases
+    };
+    localStorage.setItem(PUBLIC_CACHE_KEY, JSON.stringify(publicSnapshot));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
 
 export default function AdminPage({
   theme,
@@ -87,6 +106,15 @@ export default function AdminPage({
       if (!res.ok) throw new Error('Error al cargar el panel');
       const data = (await res.json()) as AdminAppState;
       setAdminState(data);
+      // Save server state into localStorage unless server reset to starter while local backup has newer custom releases
+      try {
+        const existingRaw = localStorage.getItem(ADMIN_BACKUP_KEY);
+        if (!existingRaw || data.releases.some((r) => r.sourceType !== 'starter')) {
+          syncLocalStorageBackup(data);
+        }
+      } catch {
+        syncLocalStorageBackup(data);
+      }
       setStateError(null);
     } catch (err) {
       setStateError(err instanceof Error ? err.message : 'Error de conexión');
@@ -216,13 +244,14 @@ export default function AdminPage({
         };
         if (xhr.status >= 200 && xhr.status < 300 && resJson.state) {
           setAdminState(resJson.state);
+          syncLocalStorageBackup(resJson.state);
           setSelectedFile(null);
           setPreviewSha256('');
           setExternalUrl('');
           setVersion('');
           setUploadProgress(0);
           if (fileInputRef.current) fileInputRef.current.value = '';
-          showFeedback('ok', 'Versión publicada y sincronizada en tiempo real con la web pública.');
+          showFeedback('ok', 'Versión publicada y guardada en servidor y localStorage.');
         } else {
           showFeedback('err', resJson.error || 'Error al publicar la versión.');
         }
@@ -253,6 +282,7 @@ export default function AdminPage({
       const data = (await res.json()) as AdminAppState;
       if (res.ok) {
         setAdminState(data);
+        syncLocalStorageBackup(data);
         showFeedback(
           'ok',
           data.maintenanceMode
@@ -279,6 +309,7 @@ export default function AdminPage({
       const data = (await res.json()) as AdminAppState;
       if (res.ok) {
         setAdminState(data);
+        syncLocalStorageBackup(data);
         showFeedback('ok', 'Versión activada inmediatamente en la página principal.');
       }
     } catch {
@@ -299,9 +330,41 @@ export default function AdminPage({
         return;
       }
       setAdminState(data);
+      syncLocalStorageBackup(data);
       showFeedback('ok', 'Versión eliminada del historial.');
     } catch {
       showFeedback('err', 'Error de red al eliminar la versión.');
+    }
+  };
+
+  const handleRestoreFromLocalStorage = async () => {
+    if (!token) return;
+    try {
+      const raw = localStorage.getItem(ADMIN_BACKUP_KEY);
+      if (!raw) return;
+      const backup = JSON.parse(raw) as AdminAppState;
+      const res = await fetch('/api/admin/restore', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          maintenanceMode: backup.maintenanceMode,
+          activeReleaseId: backup.activeReleaseId,
+          releases: backup.releases
+        })
+      });
+      const data = (await res.json()) as AdminAppState & { error?: string };
+      if (!res.ok) {
+        showFeedback('err', data.error || 'No se pudo restaurar el respaldo.');
+        return;
+      }
+      setAdminState(data);
+      syncLocalStorageBackup(data);
+      showFeedback('ok', 'Respaldo de localStorage restaurado al servidor correctamente.');
+    } catch {
+      showFeedback('err', 'Error al restaurar desde localStorage.');
     }
   };
 
@@ -328,6 +391,7 @@ export default function AdminPage({
       const data = (await res.json()) as AdminAppState;
       if (res.ok) {
         setAdminState(data);
+        syncLocalStorageBackup(data);
         setEditingRelease(null);
         showFeedback('ok', 'Metadatos de versión actualizados en vivo.');
       }
@@ -475,13 +539,9 @@ export default function AdminPage({
                 disabled={authLoading}
                 className="w-full h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 dark:bg-emerald-500 dark:hover:bg-emerald-400 text-white dark:text-slate-950 font-display font-bold text-sm transition-colors disabled:opacity-60 cursor-pointer"
               >
-                {authLoading ? 'Verificando...' : 'Iniciar Sesión en /admin'}
+                {authLoading ? 'Verificando...' : 'Iniciar Sesión'}
               </button>
             </form>
-
-            <p className="mt-5 pt-4 border-t border-slate-200 dark:border-slate-800 font-mono text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-              Credenciales por defecto configurables mediante variables de entorno (<code className="text-emerald-600 dark:text-emerald-400">ADMIN_USER</code> / <code className="text-emerald-600 dark:text-emerald-400">ADMIN_PASSWORD</code>): usuario <code className="font-semibold">admin</code> · clave <code className="font-semibold">kalfy-admin-2026</code>
-            </p>
           </div>
         </main>
       </div>
@@ -520,6 +580,46 @@ export default function AdminPage({
             {stateError}
           </div>
         )}
+
+        {(() => {
+          try {
+            const rawBackup = localStorage.getItem(ADMIN_BACKUP_KEY);
+            if (!rawBackup || !adminState) return null;
+            const parsedBackup = JSON.parse(rawBackup) as AdminAppState;
+            const backupActive = parsedBackup.releases.find(
+              (r) => r.id === parsedBackup.activeReleaseId
+            );
+            const serverActive = adminState.releases.find(
+              (r) => r.id === adminState.activeReleaseId
+            );
+            if (
+              backupActive &&
+              serverActive &&
+              (backupActive.id !== serverActive.id ||
+                parsedBackup.releases.length > adminState.releases.length)
+            ) {
+              return (
+                <div className="rounded-xl border border-cyan-500/40 bg-cyan-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="text-xs sm:text-sm text-slate-800 dark:text-slate-200">
+                    <strong className="font-semibold">Respaldo detectado en localStorage:</strong>{' '}
+                    Versión guardada <code className="font-mono">v{backupActive.version}</code> ({parsedBackup.releases.length} versiones).
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRestoreFromLocalStorage}
+                    className="px-3.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Sincronizar respaldo al servidor</span>
+                  </button>
+                </div>
+              );
+            }
+          } catch {
+            return null;
+          }
+          return null;
+        })()}
 
         {/* Top KPI Strip & Maintenance Switch */}
         <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

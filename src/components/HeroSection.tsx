@@ -7,15 +7,18 @@ import {
   Download
 } from 'lucide-react';
 import AndroidShowcase from './AndroidShowcase.tsx';
+import GalaxyBackground from './GalaxyBackground.tsx';
 import type { ApkRelease } from '../types.ts';
 
 interface HeroSectionProps {
+  theme: 'dark' | 'light';
   release: ApkRelease | null;
   maintenanceMode: boolean;
   loading: boolean;
 }
 
 export default function HeroSection({
+  theme,
   release,
   maintenanceMode,
   loading
@@ -28,23 +31,15 @@ export default function HeroSection({
   return (
     <section
       id="inicio"
-      className="relative min-h-[calc(100vh-4rem)] pt-22 pb-12 lg:pt-24 lg:pb-14 flex items-center overflow-hidden border-b border-slate-200 dark:border-slate-800/80"
+      className="relative min-h-[calc(100vh-3.75rem)] pt-24 sm:pt-28 pb-10 lg:pb-12 flex items-start lg:items-center overflow-hidden border-b border-slate-200 dark:border-slate-800/80"
     >
-      {/* Pixel-Art Galaxy Backdrop with Measured Contrast Scrim */}
-      <div
-        aria-hidden="true"
-        className="absolute inset-0 bg-cover bg-center opacity-35 dark:opacity-55 pointer-events-none"
-        style={{ backgroundImage: "url('/assets/sprites/galaxy-wide.jpg')" }}
-      />
-      <div
-        aria-hidden="true"
-        className="absolute inset-0 bg-gradient-to-b from-[#F4F7FA]/88 via-[#F4F7FA]/80 to-[#F4F7FA]/96 dark:from-[#05080D]/80 dark:via-[#05080D]/72 dark:to-[#05080D]/95 pointer-events-none"
-      />
+      {/* Interactive Mouse-Parallax Galaxy + Animated Starfield Canvas */}
+      <GalaxyBackground theme={theme} />
 
-      <div className="relative w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-8 items-center">
           {/* Left Column: Clean Title + Download APK Button + Current Version Only */}
-          <div className="lg:col-span-5 space-y-6">
+          <div className="lg:col-span-5 space-y-5">
             <div>
               <p className="font-mono text-xs sm:text-sm font-medium text-emerald-700 dark:text-emerald-400 mb-2.5">
                 Academia Táctica Android · 8 Rutas · 12 Rangos
@@ -52,20 +47,20 @@ export default function HeroSection({
 
               <h1
                 className="font-display font-bold tracking-tight text-slate-900 dark:text-slate-50 leading-[1.08]"
-                style={{ fontSize: 'clamp(2rem, 3.4vw, 3rem)', textWrap: 'balance' }}
+                style={{ fontSize: 'clamp(1.95rem, 3.2vw, 2.85rem)', textWrap: 'balance' }}
               >
                 Ciberseguridad y Hacking Ético desde tu Android
               </h1>
 
-              <p className="mt-3.5 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
+              <p className="mt-3 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
                 192 clases interactivas, laboratorios CLI en vivo, 16 misiones CTF y progreso sincronizado en la nube. Toca cualquier pantalla del móvil para explorar la app.
               </p>
             </div>
 
-            {/* Clean Download Card — Current Version & Download Button Only (No SHA-256) */}
+            {/* Clean Download Card — Current Version & Download Button Only */}
             <div
               id="descargar"
-              className="rounded-2xl border border-slate-200 dark:border-emerald-500/30 bg-white/95 dark:bg-[#0D131C]/95 backdrop-blur-md p-5 shadow-sm space-y-4"
+              className="rounded-2xl border border-slate-200 dark:border-emerald-500/30 bg-white/92 dark:bg-[#0D131C]/92 backdrop-blur-md p-5 shadow-sm space-y-4"
             >
               {maintenanceMode ? (
                 <div className="flex items-start gap-3">
@@ -93,7 +88,7 @@ export default function HeroSection({
                   >
                     <Download className="w-5 h-5 shrink-0" />
                     <span>
-                      {loading
+                      {loading && !release
                         ? 'Cargando archivo...'
                         : `Descargar Archivo APK (${versionLabel})`}
                     </span>

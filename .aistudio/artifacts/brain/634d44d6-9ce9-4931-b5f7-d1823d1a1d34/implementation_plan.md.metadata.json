@@ -1,6 +1,6 @@
 {
-  "summary":  "Redesign the KALFY public landing page into a compact, minimal-scroll showcase featuring two interactive Android app screens (8 Learning Routes and 12 Official Ranks with cleanly cropped pixel-art sprites), a clean APK download button showing only the current version without SHA-256 or terminal text clutter, and the separate /admin release manager.",
-  "updatedAt":  "2026-11-18T16:47:02.955945685Z",
+  "summary":  "Update KALFY with hidden admin route /kalfy-studio-94x (removing footer link), updated admin credentials (Kalfy2026! hidden from UI), resilient server + localStorage persistence, interactive mouse-parallax galaxy canvas with animated star particles, and top-padding fix so hero content never clips beneath the navbar.",
+  "updatedAt":  "2026-11-18T18:42:58.852042704Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

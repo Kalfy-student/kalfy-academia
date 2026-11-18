@@ -6,6 +6,27 @@ import AdminPage from './pages/AdminPage.tsx';
 import type { PublicAppState } from './types.ts';
 
 const THEME_STORAGE_KEY = 'kalfy_theme';
+const PUBLIC_CACHE_KEY = 'kalfy_public_state_cache';
+const SECRET_ADMIN_PATH = '/kalfy-studio-94x';
+
+function readCachedPublicState(): PublicAppState {
+  try {
+    const raw = localStorage.getItem(PUBLIC_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as PublicAppState;
+      if (parsed && typeof parsed.maintenanceMode === 'boolean') {
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore invalid localStorage cache
+  }
+  return {
+    maintenanceMode: false,
+    activeRelease: null,
+    changelogHistory: []
+  };
+}
 
 export default function App() {
   const [pathname, setPathname] = useState<string>(() => window.location.pathname);
@@ -14,12 +35,8 @@ export default function App() {
     return saved === 'light' ? 'light' : 'dark';
   });
 
-  const [publicState, setPublicState] = useState<PublicAppState>({
-    maintenanceMode: false,
-    activeRelease: null,
-    changelogHistory: []
-  });
-  const [loading, setLoading] = useState(true);
+  const [publicState, setPublicState] = useState<PublicAppState>(() => readCachedPublicState());
+  const [loading, setLoading] = useState(() => !readCachedPublicState().activeRelease);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -51,9 +68,14 @@ export default function App() {
       if (res.ok) {
         const data = (await res.json()) as PublicAppState;
         setPublicState(data);
+        try {
+          localStorage.setItem(PUBLIC_CACHE_KEY, JSON.stringify(data));
+        } catch {
+          // Ignore storage quota errors
+        }
       }
     } catch {
-      // Keep last state on transient error
+      // Retain localStorage cached state on offline/transient error
     } finally {
       setLoading(false);
     }
@@ -81,7 +103,8 @@ export default function App() {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   };
 
-  if (pathname.startsWith('/admin')) {
+  // Hidden private management route ONLY on /kalfy-studio-94x
+  if (pathname === SECRET_ADMIN_PATH || pathname === `${SECRET_ADMIN_PATH}/`) {
     return (
       <AdminPage
         theme={theme}
@@ -104,13 +127,14 @@ export default function App() {
 
       <main className="flex-1">
         <HeroSection
+          theme={theme}
           release={publicState.activeRelease}
           maintenanceMode={publicState.maintenanceMode}
           loading={loading}
         />
       </main>
 
-      <Footer onOpenAdmin={() => navigateTo('/admin')} />
+      <Footer />
     </div>
   );
 }

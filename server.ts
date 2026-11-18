@@ -11,12 +11,14 @@ dotenv.config();
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
-const DATA_DIR = path.join(ROOT_DIR, 'data');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(ROOT_DIR, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const RELEASES_FILE = path.join(DATA_DIR, 'releases.json');
 
-const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'kalfy-admin-2026';
+const ADMIN_USER = 'admin';
+const ADMIN_PASSWORD = 'Kalfy2026!';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'kalfy-default-hmac-secret-2026';
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -366,6 +368,45 @@ async function startServer() {
   app.post('/api/admin/maintenance', requireAdmin, (req, res) => {
     const { maintenanceMode } = req.body as { maintenanceMode?: boolean };
     appState.maintenanceMode = Boolean(maintenanceMode);
+    saveState(appState);
+    broadcastStateUpdate();
+    res.json(buildAdminState());
+  });
+
+  // Admin Restore Backup from localStorage (useful on ephemeral hosts)
+  app.post('/api/admin/restore', requireAdmin, (req, res) => {
+    const body = req.body as {
+      maintenanceMode?: boolean;
+      activeReleaseId?: string;
+      releases?: ApkRelease[];
+    };
+    if (!Array.isArray(body.releases) || body.releases.length === 0) {
+      res.status(400).json({ error: 'El respaldo no contiene versiones válidas.' });
+      return;
+    }
+
+    const sanitizedReleases: ApkRelease[] = body.releases.map((rel) => {
+      const hasLocalFile =
+        rel.storageFileName && fs.existsSync(path.join(UPLOADS_DIR, rel.storageFileName));
+      if (rel.sourceType === 'upload' && !hasLocalFile) {
+        // Fallback to starter file only if uploaded binary was wiped on ephemeral disk, preserving metadata
+        return {
+          ...rel,
+          storageFileName: 'kalfy-v1.1.0-oficial.apk'
+        };
+      }
+      return rel;
+    });
+
+    appState = {
+      maintenanceMode: Boolean(body.maintenanceMode),
+      activeReleaseId:
+        body.activeReleaseId && sanitizedReleases.some((r) => r.id === body.activeReleaseId)
+          ? body.activeReleaseId
+          : sanitizedReleases[0].id,
+      releases: sanitizedReleases
+    };
+
     saveState(appState);
     broadcastStateUpdate();
     res.json(buildAdminState());
