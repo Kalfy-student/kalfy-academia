@@ -4,11 +4,13 @@ import {
   ArrowLeft,
   Check,
   CheckCircle2,
+  Cloud,
   Copy,
   Edit3,
   Eye,
   EyeOff,
   FileArchive,
+  HardDrive,
   Link as LinkIcon,
   Lock,
   LogOut,
@@ -22,6 +24,7 @@ import {
   X
 } from 'lucide-react';
 import type { AdminAppState, ApkRelease, PublicAppState } from '../types.ts';
+import { deleteApkBlob, getApkBlob, saveApkBlob } from '../utils/apkVault.ts';
 
 interface AdminPageProps {
   theme: 'dark' | 'light';
@@ -91,44 +94,149 @@ export default function AdminPage({
   const [editVersion, setEditVersion] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const autoRestoringRef = useRef(false);
 
   const showFeedback = (type: 'ok' | 'err', msg: string) => {
     setFeedback({ type, msg });
-    setTimeout(() => setFeedback(null), 5000);
+    setTimeout(() => setFeedback(null), 6000);
   };
 
-  const fetchAdminState = useCallback(async (authToken: string) => {
-    setLoadingState(true);
-    try {
-      const res = await fetch('/api/admin/state', {
-        cache: 'no-store',
-        headers: { Authorization: `Bearer ${authToken}` }
-      });
-      if (res.status === 401) {
-        localStorage.removeItem(TOKEN_STORAGE_KEY);
-        setToken(null);
-        setAdminState(null);
-        return;
-      }
-      if (!res.ok) throw new Error('Error al cargar el panel');
-      const data = (await res.json()) as AdminAppState;
-      setAdminState(data);
-      // Save server state into localStorage unless server reset to starter while local backup has newer custom releases
+  const restoreBackupToServer = useCallback(
+    async (authToken: string, backup: AdminAppState): Promise<AdminAppState | null> => {
+      if (autoRestoringRef.current) return null;
+      autoRestoringRef.current = true;
       try {
-        const existingRaw = localStorage.getItem(ADMIN_BACKUP_KEY);
-        if (!existingRaw || data.releases.some((r) => r.sourceType !== 'starter')) {
+        // 1. Restore metadata + maintenanceMode + external releases
+        const metaRes = await fetch('/api/admin/restore', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`
+          },
+          body: JSON.stringify({
+            maintenanceMode: backup.maintenanceMode,
+            activeReleaseId: backup.activeReleaseId,
+            releases: backup.releases
+          })
+        });
+        if (!metaRes.ok) return null;
+        let latestState = (await metaRes.json()) as AdminAppState;
+
+        // 2. Re-upload any missing APK binaries directly from browser IndexedDB vault
+        for (const rel of backup.releases) {
+          if (rel.sourceType !== 'upload') continue;
+          const serverRel = latestState.releases.find((r) => r.id === rel.id);
+          if (serverRel && !serverRel.binaryMissing) continue;
+
+          const cached = await getApkBlob(rel.id);
+          if (!cached) continue;
+
+          const fd = new FormData();
+          fd.append('releaseId', rel.id);
+          fd.append('version', rel.version);
+          fd.append('fileName', rel.fileName);
+          fd.append('releaseDate', rel.releaseDate);
+          fd.append('createdAt', rel.createdAt);
+          fd.append('downloads', String(rel.downloads || 0));
+          fd.append('notes', JSON.stringify(rel.notes || []));
+          fd.append('activate', String(rel.id === backup.activeReleaseId));
+          fd.append('apkFile', cached.blob, rel.fileName || cached.fileName);
+
+          const binRes = await fetch('/api/admin/restore-binary', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${authToken}` },
+            body: fd
+          });
+          if (binRes.ok) {
+            latestState = (await binRes.json()) as AdminAppState;
+          }
+        }
+
+        return latestState;
+      } finally {
+        autoRestoringRef.current = false;
+      }
+    },
+    []
+  );
+
+  const fetchAdminState = useCallback(
+    async (authToken: string) => {
+      setLoadingState(true);
+      try {
+        const res = await fetch('/api/admin/state', {
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${authToken}` }
+        });
+        if (res.status === 401) {
+          localStorage.removeItem(TOKEN_STORAGE_KEY);
+          setToken(null);
+          setAdminState(null);
+          return;
+        }
+        if (!res.ok) throw new Error('Error al cargar el panel');
+        let data = (await res.json()) as AdminAppState;
+
+        // Detect if server ephemeral disk was wiped back to starter while localStorage + IndexedDB hold custom releases
+        const serverIsFreshStarter =
+          data.releases.length === 1 &&
+          data.releases[0].id === 'rel-1-1-0' &&
+          data.releases[0].sourceType === 'starter' &&
+          data.releases[0].downloads === 0 &&
+          !data.maintenanceMode;
+
+        let backup: AdminAppState | null = null;
+        try {
+          const existingRaw = localStorage.getItem(ADMIN_BACKUP_KEY);
+          if (existingRaw) {
+            backup = JSON.parse(existingRaw) as AdminAppState;
+          }
+        } catch {
+          backup = null;
+        }
+
+        const backupHasCustomData = Boolean(
+          backup &&
+            Array.isArray(backup.releases) &&
+            (backup.releases.some((r) => r.sourceType !== 'starter') ||
+              backup.maintenanceMode ||
+              backup.releases.some((r) => r.downloads > 0))
+        );
+
+        if (serverIsFreshStarter && backup && backupHasCustomData) {
+          const restored = await restoreBackupToServer(authToken, backup);
+          if (restored) {
+            data = restored;
+            syncLocalStorageBackup(data);
+            const active = data.releases.find((r) => r.id === data.activeReleaseId);
+            showFeedback(
+              'ok',
+              active
+                ? `El servidor se había reiniciado y restauramos automáticamente v${active.version} desde tu respaldo local.`
+                : 'Respaldo restaurado automáticamente al servidor.'
+            );
+          }
+        } else if (data.releases.some((r) => r.binaryMissing)) {
+          // Heal any release whose binary was wiped from disk if we have it in IndexedDB
+          const healed = await restoreBackupToServer(authToken, data);
+          if (healed) {
+            data = healed;
+            syncLocalStorageBackup(data);
+          }
+        } else if (!backup || !serverIsFreshStarter) {
           syncLocalStorageBackup(data);
         }
-      } catch {
-        syncLocalStorageBackup(data);
+
+        setAdminState(data);
+        setStateError(null);
+      } catch (err) {
+        setStateError(err instanceof Error ? err.message : 'Error de conexión');
+      } finally {
+        setLoadingState(false);
       }
-      setStateError(null);
-    } catch (err) {
-      setStateError(err instanceof Error ? err.message : 'Error de conexión');
-    } finally {
-      setLoadingState(false);
-    }
-  }, []);
+    },
+    [restoreBackupToServer]
+  );
 
   useEffect(() => {
     if (!token) return;
@@ -257,14 +365,18 @@ export default function AdminPage({
       }
     };
 
-    xhr.onload = () => {
+    xhr.onload = async () => {
       setUploading(false);
       try {
         const resJson = JSON.parse(xhr.responseText) as {
+          release?: ApkRelease;
           state?: AdminAppState;
           error?: string;
         };
         if (xhr.status >= 200 && xhr.status < 300 && resJson.state) {
+          if (resJson.release && sourceMode === 'file' && selectedFile) {
+            await saveApkBlob(resJson.release.id, selectedFile, resJson.release.fileName);
+          }
           setAdminState(resJson.state);
           syncLocalStorageBackup(resJson.state);
           setSelectedFile(null);
@@ -273,7 +385,12 @@ export default function AdminPage({
           setVersion('');
           setUploadProgress(0);
           if (fileInputRef.current) fileInputRef.current.value = '';
-          showFeedback('ok', 'Versión publicada y guardada en servidor y localStorage.');
+          showFeedback(
+            'ok',
+            resJson.state.storageMode === 'cloud-github'
+              ? 'Versión publicada y guardada en la nube (GitHub Releases) + IndexedDB.'
+              : 'Versión publicada y respaldada en servidor, IndexedDB y localStorage.'
+          );
         } else {
           showFeedback('err', resJson.error || 'Error al publicar la versión.');
         }
@@ -392,6 +509,7 @@ export default function AdminPage({
         showFeedback('err', data.error || 'No se pudo eliminar la versión.');
         return;
       }
+      await deleteApkBlob(id);
       setAdminState(data);
       syncLocalStorageBackup(data);
       showFeedback('ok', 'Versión eliminada del historial.');
@@ -406,28 +524,16 @@ export default function AdminPage({
       const raw = localStorage.getItem(ADMIN_BACKUP_KEY);
       if (!raw) return;
       const backup = JSON.parse(raw) as AdminAppState;
-      const res = await fetch('/api/admin/restore', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          maintenanceMode: backup.maintenanceMode,
-          activeReleaseId: backup.activeReleaseId,
-          releases: backup.releases
-        })
-      });
-      const data = (await res.json()) as AdminAppState & { error?: string };
-      if (!res.ok) {
-        showFeedback('err', data.error || 'No se pudo restaurar el respaldo.');
+      const restored = await restoreBackupToServer(token, backup);
+      if (!restored) {
+        showFeedback('err', 'No se pudo restaurar el respaldo.');
         return;
       }
-      setAdminState(data);
-      syncLocalStorageBackup(data);
-      showFeedback('ok', 'Respaldo de localStorage restaurado al servidor correctamente.');
+      setAdminState(restored);
+      syncLocalStorageBackup(restored);
+      showFeedback('ok', 'Respaldo completo (versión + APK) restaurado al servidor.');
     } catch {
-      showFeedback('err', 'Error al restaurar desde localStorage.');
+      showFeedback('err', 'Error al restaurar desde localStorage e IndexedDB.');
     }
   };
 
@@ -744,6 +850,54 @@ export default function AdminPage({
           }
           return null;
         })()}
+
+        {adminState && (
+          <div
+            className={`rounded-xl border p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+              adminState.storageMode === 'ephemeral-local'
+                ? 'border-cyan-500/35 bg-cyan-500/8'
+                : 'border-emerald-500/35 bg-emerald-500/8'
+            }`}
+          >
+            <div className="flex items-start gap-3 text-xs sm:text-sm text-slate-700 dark:text-slate-200">
+              {adminState.storageMode === 'cloud-github' ? (
+                <Cloud className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
+              ) : (
+                <HardDrive
+                  className={`w-5 h-5 shrink-0 mt-0.5 ${
+                    adminState.storageMode === 'custom-disk'
+                      ? 'text-emerald-500'
+                      : 'text-cyan-500'
+                  }`}
+                />
+              )}
+              <div>
+                {adminState.storageMode === 'cloud-github' ? (
+                  <>
+                    <strong className="font-semibold text-emerald-700 dark:text-emerald-300">
+                      Persistencia Permanente en Nube Activa (GitHub Releases):
+                    </strong>{' '}
+                    Tus APKs y versiones sobreviven a cualquier reinicio o suspensión del servidor.
+                  </>
+                ) : adminState.storageMode === 'custom-disk' ? (
+                  <>
+                    <strong className="font-semibold text-emerald-700 dark:text-emerald-300">
+                      Disco Persistente Activo:
+                    </strong>{' '}
+                    Los archivos se guardan en el volumen persistente configurado en <code className="font-mono">DATA_DIR</code>.
+                  </>
+                ) : (
+                  <>
+                    <strong className="font-semibold text-cyan-700 dark:text-cyan-300">
+                      Almacenamiento Temporal + Respaldo Automático en Navegador:
+                    </strong>{' '}
+                    Si alojas en Render Free o Cloud Run, el disco del servidor se reinicia tras ~15 min sin actividad. Este navegador guarda tu APK en <strong>IndexedDB</strong> y lo restaura al entrar aquí; para que sea 100% permanente sin depender del navegador, usa la pestaña <strong>URL Directa</strong> o configura <code className="font-mono">GITHUB_TOKEN</code> y <code className="font-mono">GITHUB_REPO</code> en las variables del servidor.
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Top KPI Strip & Maintenance Switch */}
         <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1110,7 +1264,11 @@ export default function AdminPage({
                         {rel.downloads.toLocaleString('es-ES')}
                       </td>
                       <td className="py-3.5 px-4 font-mono text-xs whitespace-nowrap">
-                        {isActive ? (
+                        {rel.binaryMissing ? (
+                          <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                            Binario perdido en servidor
+                          </span>
+                        ) : isActive ? (
                           <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
                             Activa en Web
                           </span>

@@ -5,19 +5,31 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
-import type { ApkRelease, AdminAppState, PublicAppState } from './src/types.ts';
+import type {
+  ApkRelease,
+  AdminAppState,
+  PublicAppState,
+  StoragePersistenceMode
+} from './src/types.ts';
 
 dotenv.config();
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
 const RAW_DATA_DIR = process.env.DATA_DIR?.trim();
-const DATA_DIR =
+const HAS_CUSTOM_DATA_DIR = Boolean(
   RAW_DATA_DIR && (RAW_DATA_DIR.includes('/') || RAW_DATA_DIR.startsWith('.'))
-    ? path.resolve(RAW_DATA_DIR)
-    : path.join(ROOT_DIR, 'data');
+);
+const DATA_DIR = HAS_CUSTOM_DATA_DIR && RAW_DATA_DIR
+  ? path.resolve(RAW_DATA_DIR)
+  : path.join(ROOT_DIR, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const RELEASES_FILE = path.join(DATA_DIR, 'releases.json');
+
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN?.trim() || '';
+const GITHUB_REPO = process.env.GITHUB_REPO?.trim() || '';
+const GITHUB_RELEASE_TAG = 'kalfy-apk-store';
+const HAS_GITHUB_CLOUD = Boolean(GITHUB_TOKEN && GITHUB_REPO && GITHUB_REPO.includes('/'));
 
 const ADMIN_USER = 'admin';
 const ADMIN_PASSWORD = 'Kalfy2026!';
@@ -29,6 +41,12 @@ interface StoredState {
   maintenanceMode: boolean;
   activeReleaseId: string;
   releases: ApkRelease[];
+}
+
+function getStoragePersistenceMode(): StoragePersistenceMode {
+  if (HAS_GITHUB_CLOUD) return 'cloud-github';
+  if (HAS_CUSTOM_DATA_DIR) return 'custom-disk';
+  return 'ephemeral-local';
 }
 
 function formatMB(bytes: number): string {
@@ -147,8 +165,176 @@ function loadState(): StoredState {
   return initialState;
 }
 
-function saveState(state: StoredState): void {
+function saveLocalStateOnly(state: StoredState): void {
   fs.writeFileSync(RELEASES_FILE, JSON.stringify(state, null, 2), 'utf8');
+}
+
+interface GitHubReleaseAsset {
+  id: number;
+  name: string;
+  url: string;
+  browser_download_url: string;
+}
+
+interface GitHubReleaseResponse {
+  id: number;
+  upload_url: string;
+  assets: GitHubReleaseAsset[];
+}
+
+function githubHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'kalfy-portal-storage',
+    ...extra
+  };
+}
+
+async function getOrCreateCloudRelease(): Promise<GitHubReleaseResponse | null> {
+  if (!HAS_GITHUB_CLOUD) return null;
+  const tagUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${GITHUB_RELEASE_TAG}`;
+  const existing = await fetch(tagUrl, { headers: githubHeaders() });
+  if (existing.ok) {
+    return (await existing.json()) as GitHubReleaseResponse;
+  }
+  if (existing.status === 404) {
+    const createRes = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases`, {
+      method: 'POST',
+      headers: githubHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        tag_name: GITHUB_RELEASE_TAG,
+        name: 'KALFY Persistent APK Storage',
+        body: 'Almacenamiento automático de versiones APK y metadatos de KALFY.',
+        draft: false,
+        prerelease: false
+      })
+    });
+    if (createRes.ok) {
+      return (await createRes.json()) as GitHubReleaseResponse;
+    }
+  }
+  return null;
+}
+
+async function uploadBufferToCloudAsset(
+  release: GitHubReleaseResponse,
+  assetName: string,
+  content: Buffer,
+  contentType: string
+): Promise<void> {
+  const existingAsset = release.assets.find((a) => a.name === assetName);
+  if (existingAsset) {
+    await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/assets/${existingAsset.id}`, {
+      method: 'DELETE',
+      headers: githubHeaders()
+    });
+  }
+  const uploadBase = release.upload_url.replace(/\{.*$/, '');
+  const uploadRes = await fetch(`${uploadBase}?name=${encodeURIComponent(assetName)}`, {
+    method: 'POST',
+    headers: githubHeaders({
+      'Content-Type': contentType,
+      'Content-Length': String(content.length)
+    }),
+    body: new Uint8Array(content)
+  });
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    throw new Error(`GitHub Release upload failed (${uploadRes.status}): ${errText}`);
+  }
+}
+
+let cloudSyncChain: Promise<void> = Promise.resolve();
+
+function scheduleCloudStateSync(stateSnapshot: StoredState): void {
+  if (!HAS_GITHUB_CLOUD) return;
+  const payload = JSON.stringify(stateSnapshot, null, 2);
+  cloudSyncChain = cloudSyncChain
+    .then(async () => {
+      const release = await getOrCreateCloudRelease();
+      if (!release) return;
+      await uploadBufferToCloudAsset(
+        release,
+        'kalfy-state.json',
+        Buffer.from(payload, 'utf8'),
+        'application/json'
+      );
+    })
+    .catch((err) => {
+      console.error('GitHub Releases state sync failed:', err);
+    });
+}
+
+async function syncBinaryToCloud(storageFileName: string, localFilePath: string): Promise<void> {
+  if (!HAS_GITHUB_CLOUD || !fs.existsSync(localFilePath)) return;
+  const release = await getOrCreateCloudRelease();
+  if (!release) return;
+  const buf = fs.readFileSync(localFilePath);
+  await uploadBufferToCloudAsset(
+    release,
+    storageFileName,
+    buf,
+    'application/vnd.android.package-archive'
+  );
+}
+
+async function bootstrapCloudStorage(): Promise<void> {
+  if (!HAS_GITHUB_CLOUD) return;
+  try {
+    const release = await getOrCreateCloudRelease();
+    if (!release) return;
+
+    const stateAsset = release.assets.find((a) => a.name === 'kalfy-state.json');
+    if (stateAsset) {
+      const assetRes = await fetch(stateAsset.url, {
+        headers: githubHeaders({ Accept: 'application/octet-stream' })
+      });
+      if (assetRes.ok) {
+        const parsed = (await assetRes.json()) as StoredState;
+        if (parsed && Array.isArray(parsed.releases) && parsed.releases.length > 0) {
+          const localOnlyStarter =
+            appState.releases.length === 1 &&
+            appState.releases[0].sourceType === 'starter' &&
+            appState.releases[0].downloads === 0;
+          const cloudHasMore =
+            parsed.releases.some((r) => r.sourceType !== 'starter') ||
+            parsed.maintenanceMode ||
+            parsed.releases.some((r) => r.downloads > 0);
+          if (!fs.existsSync(RELEASES_FILE) || (localOnlyStarter && cloudHasMore)) {
+            appState = parsed;
+            saveLocalStateOnly(appState);
+          }
+        }
+      }
+    }
+
+    // Download any missing uploaded APK assets from GitHub Releases to UPLOADS_DIR
+    for (const rel of appState.releases) {
+      if (rel.sourceType === 'upload' && rel.storageFileName) {
+        const destPath = path.join(UPLOADS_DIR, rel.storageFileName);
+        if (!fs.existsSync(destPath)) {
+          const asset = release.assets.find((a) => a.name === rel.storageFileName);
+          if (asset) {
+            const binRes = await fetch(asset.url, {
+              headers: githubHeaders({ Accept: 'application/octet-stream' })
+            });
+            if (binRes.ok) {
+              const arrayBuf = await binRes.arrayBuffer();
+              fs.writeFileSync(destPath, Buffer.from(arrayBuf));
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to bootstrap from GitHub Releases:', err);
+  }
+}
+
+function saveState(state: StoredState): void {
+  saveLocalStateOnly(state);
+  scheduleCloudStateSync(state);
 }
 
 let appState: StoredState = loadState();
@@ -249,11 +435,24 @@ function buildPublicState(): PublicAppState {
 
 function buildAdminState(): AdminAppState {
   const totalDownloads = appState.releases.reduce((acc, r) => acc + r.downloads, 0);
+  const releasesWithStatus = [...appState.releases]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map((rel) => {
+      const missing =
+        rel.sourceType === 'upload' &&
+        (!rel.storageFileName || !fs.existsSync(path.join(UPLOADS_DIR, rel.storageFileName)));
+      return {
+        ...rel,
+        binaryMissing: missing || undefined
+      };
+    });
+
   return {
     maintenanceMode: appState.maintenanceMode,
     activeReleaseId: appState.activeReleaseId,
     totalDownloads,
-    releases: [...appState.releases].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    storageMode: getStoragePersistenceMode(),
+    releases: releasesWithStatus
   };
 }
 
@@ -307,19 +506,20 @@ async function startServer() {
       return;
     }
 
-    const releaseId = typeof req.query.id === 'string' ? req.query.id : appState.activeReleaseId;
-    const release = appState.releases.find((r) => r.id === releaseId) || appState.releases[0];
+    const requestedId = typeof req.query.id === 'string' ? req.query.id : appState.activeReleaseId;
+    const release =
+      appState.releases.find((r) => r.id === requestedId) ||
+      (!req.query.id ? appState.releases.find((r) => r.id === appState.activeReleaseId) || appState.releases[0] : undefined);
 
     if (!release) {
-      res.status(404).json({ error: 'No hay ninguna versión de APK disponible.' });
+      res.status(404).json({ error: 'La versión de APK solicitada no está disponible.' });
       return;
     }
 
-    release.downloads += 1;
-    saveState(appState);
-    broadcastStateUpdate();
-
     if (release.sourceType === 'external' && release.externalUrl) {
+      release.downloads += 1;
+      saveState(appState);
+      broadcastStateUpdate();
       res.redirect(302, release.externalUrl);
       return;
     }
@@ -329,13 +529,19 @@ async function startServer() {
       : '';
 
     if (storagePath && fs.existsSync(storagePath)) {
+      release.downloads += 1;
+      saveState(appState);
+      broadcastStateUpdate();
       res.setHeader('Content-Type', 'application/vnd.android.package-archive');
       res.setHeader('Content-Disposition', `attachment; filename="${release.fileName}"`);
       res.sendFile(storagePath);
       return;
     }
 
-    res.status(404).json({ error: 'El archivo APK solicitado no se encuentra en almacenamiento.' });
+    res.status(404).json({
+      error:
+        'El archivo binario APK no se encuentra en almacenamiento. Ábrelo en el panel de administración para restaurarlo.'
+    });
   });
 
   // Admin Login
@@ -375,7 +581,7 @@ async function startServer() {
     res.json(buildAdminState());
   });
 
-  // Admin Restore Backup from localStorage (useful on ephemeral hosts)
+  // Admin Restore Backup from localStorage (metadata & external releases)
   app.post('/api/admin/restore', requireAdmin, (req, res) => {
     const body = req.body as {
       maintenanceMode?: boolean;
@@ -388,14 +594,8 @@ async function startServer() {
     }
 
     const sanitizedReleases: ApkRelease[] = body.releases.map((rel) => {
-      const hasLocalFile =
-        rel.storageFileName && fs.existsSync(path.join(UPLOADS_DIR, rel.storageFileName));
-      if (rel.sourceType === 'upload' && !hasLocalFile) {
-        // Fallback to starter file only if uploaded binary was wiped on ephemeral disk, preserving metadata
-        return {
-          ...rel,
-          storageFileName: 'kalfy-v1.1.0-oficial.apk'
-        };
+      if (rel.sourceType === 'starter') {
+        createStarterApkIfNeeded();
       }
       return rel;
     });
@@ -413,6 +613,103 @@ async function startServer() {
     broadcastStateUpdate();
     res.json(buildAdminState());
   });
+
+  // Admin Restore APK Binary from browser IndexedDB backup
+  app.post(
+    '/api/admin/restore-binary',
+    requireAdmin,
+    (req, res, next) => {
+      upload.single('apkFile')(req, res, (err) => {
+        if (err) {
+          res.status(400).json({ error: err instanceof Error ? err.message : 'Error al restaurar APK' });
+          return;
+        }
+        next();
+      });
+    },
+    async (req, res) => {
+      try {
+        if (!req.file) {
+          res.status(400).json({ error: 'No se recibió el archivo binario .apk para restaurar.' });
+          return;
+        }
+        const releaseId = typeof req.body.releaseId === 'string' ? req.body.releaseId.trim() : '';
+        const versionRaw = typeof req.body.version === 'string' ? req.body.version.trim() : '';
+        const fileName =
+          typeof req.body.fileName === 'string' && req.body.fileName.trim()
+            ? req.body.fileName.trim()
+            : req.file.originalname;
+        const releaseDate =
+          typeof req.body.releaseDate === 'string' && req.body.releaseDate.trim()
+            ? req.body.releaseDate.trim()
+            : new Date().toISOString().slice(0, 10);
+        const createdAt =
+          typeof req.body.createdAt === 'string' && req.body.createdAt.trim()
+            ? req.body.createdAt.trim()
+            : new Date().toISOString();
+        const downloads = Math.max(0, Number(req.body.downloads) || 0);
+        const activateNow = req.body.activate === 'true';
+        const notesRaw = typeof req.body.notes === 'string' ? req.body.notes : '';
+        let notes: string[] = [];
+        try {
+          const parsedNotes = JSON.parse(notesRaw);
+          if (Array.isArray(parsedNotes)) {
+            notes = parsedNotes.map((n) => String(n).trim()).filter(Boolean);
+          }
+        } catch {
+          notes = String(notesRaw)
+            .split('\n')
+            .map((line: string) => line.replace(/^[-•*]\s*/, '').trim())
+            .filter(Boolean);
+        }
+
+        const sha256 = await computeFileSha256(req.file.path);
+        const restoredId = releaseId || `rel-${Date.now()}`;
+        const cleanVer = (versionRaw || '1.0.0').replace(/^v/i, '');
+        if (notes.length === 0) {
+          notes = [`Actualización oficial KALFY v${cleanVer}`];
+        }
+
+        await syncBinaryToCloud(req.file.filename, req.file.path).catch((err) => {
+          console.error('Cloud binary sync warning:', err);
+        });
+
+        const restoredRelease: ApkRelease = {
+          id: restoredId,
+          version: cleanVer,
+          fileName: fileName.endsWith('.apk') ? fileName : `kalfy-v${cleanVer}.apk`,
+          sizeBytes: req.file.size,
+          sizeFormatted: formatMB(req.file.size),
+          sha256,
+          releaseDate,
+          createdAt,
+          downloads,
+          sourceType: 'upload',
+          storageFileName: req.file.filename,
+          notes
+        };
+
+        const existingIdx = appState.releases.findIndex((r) => r.id === restoredId);
+        if (existingIdx >= 0) {
+          appState.releases[existingIdx] = restoredRelease;
+        } else {
+          appState.releases.unshift(restoredRelease);
+        }
+
+        if (activateNow) {
+          appState.activeReleaseId = restoredId;
+        }
+
+        saveState(appState);
+        broadcastStateUpdate();
+        res.json(buildAdminState());
+      } catch (err) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Error restaurando el binario APK'
+        });
+      }
+    }
+  );
 
   // Admin Upload new APK or External URL Release
   app.post(
@@ -459,6 +756,9 @@ async function startServer() {
 
         if (req.file) {
           const sha256 = await computeFileSha256(req.file.path);
+          await syncBinaryToCloud(req.file.filename, req.file.path).catch((err) => {
+            console.error('Cloud binary sync warning:', err);
+          });
           newRelease = {
             id: releaseId,
             version: versionRaw.replace(/^v/i, ''),
@@ -613,8 +913,10 @@ async function startServer() {
     });
   }
 
+  await bootstrapCloudStorage();
+
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`KALFY server running on http://0.0.0.0:${PORT}`);
+    console.log(`KALFY server running on http://0.0.0.0:${PORT} (storage: ${getStoragePersistenceMode()})`);
   });
 }
 

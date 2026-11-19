@@ -11,6 +11,7 @@ export interface ApkRelease {
   sourceType: 'upload' | 'external' | 'starter';
   storageFileName?: string;
   externalUrl?: string;
+  binaryMissing?: boolean;
   notes: string[];
 }
 
@@ -20,10 +21,13 @@ export interface PublicAppState {
   changelogHistory: ApkRelease[];
 }
 
+export type StoragePersistenceMode = 'cloud-github' | 'custom-disk' | 'ephemeral-local';
+
 export interface AdminAppState {
   maintenanceMode: boolean;
   activeReleaseId: string;
   totalDownloads: number;
+  storageMode?: StoragePersistenceMode;
   releases: ApkRelease[];
 }
 
